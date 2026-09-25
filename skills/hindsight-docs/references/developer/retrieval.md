@@ -2,25 +2,22 @@
 sidebar_position: 3
 ---
 
+
 # Recall: How Hindsight Retrieves Memories
 
 When you call `recall()`, Hindsight uses multiple search strategies in parallel to find the most relevant memories, regardless of how you phrase your query.
 
-```mermaid
-graph LR
-    Q[Query] --> S[Semantic]
-    Q --> K[Keyword]
-    Q --> G[Graph]
-    Q --> T[Temporal]
+**Figure: Multi-Strategy Retrieval (TEMPR).** An animated diagram on the docs site; its narration, step by step:
 
-    S --> RRF[RRF Fusion]
-    K --> RRF
-    G --> RRF
-    T --> RRF
-
-    RRF --> CE[Cross-Encoder]
-    CE --> R[Results]
-```
+- **recall()**
+  1. recall() gets a query. Nothing is decided yet about which kind of search fits it best, so every arm that applies runs.
+  2. Each arm searches its own index: meaning (vectors), exact words (BM25), the entity graph, and time. “March 2026” becomes a date range; a query with no date skips the time arm.
+  3. All four point into the same memories. Each arm returns its own ranked list, and facts and observations compete in every one. The mark shows how many arms found each.
+  4. RRF fusion merges the lists by rank, not raw score: a memory found near the top by several arms beats one found by a single arm.
+  5. The top candidates (up to 300) go to a cross-encoder, which reads the query and each memory together and scores how well they match.
+  6. Small multiplicative boosts nudge the score: recent memories, memories inside the asked time range, and observations backed by more evidence.
+  7. Results are packed best-first until max_tokens is used up. Only the memory text counts toward the budget.
+  8. The agent gets a short, ranked list it can put straight into its prompt.
 
 ---
 
@@ -267,7 +264,7 @@ The first memory ranks higher because it has **consensus** across strategies.
 
 RRF gives a good initial ranking, but it's based on positions, not on deep query-document understanding. The cross-encoder evaluates each candidate against the query as a pair, producing a relevance score.
 
-**Pre-filtering:** Before reranking, candidates are trimmed to the top **300** (by RRF score) to limit computational cost. This is configurable via `HINDSIGHT_API_RERANKER_MAX_CANDIDATES`. If [`HINDSIGHT_API_RECALL_STRATEGY_BOOSTS`](./configuration) is set, the boost is applied to the RRF scores before this cut, so candidates from a favoured source are more likely to survive it.
+**Pre-filtering:** Before reranking, candidates are trimmed to the top **300** (by RRF score) to limit computational cost. This is configurable via `HINDSIGHT_API_RERANKER_MAX_CANDIDATES`. If [`HINDSIGHT_API_RECALL_STRATEGY_BOOSTS`](./configuration) is set, the boost is applied before this cut, so candidates from a favoured source are more likely to survive it. The boost promotes the favoured arm in *rank* space (its rank is divided by the level's divisor before the RRF contribution is computed) rather than scaling its score, so it reaches deeper into that arm without evicting the top-ranked hits of the others — including on banks whose merged pool is many times the cap. When `trace: true` is requested, the `rerank_prefilter` phase reports how many candidates were kept and dropped, the cap in force, the active boosts, and the per-arm composition of the survivors.
 
 **Why rerank after RRF?** RRF is position-based — it knows a memory ranked well across strategies, but it never actually reads the query and the memory together. The cross-encoder does: it takes the query and each candidate as a pair and produces a relevance score based on their full interaction. This catches nuances that position-based fusion misses, like a memory that ranked #1 in keyword search because it matched a common term but is actually irrelevant to the query's intent.
 

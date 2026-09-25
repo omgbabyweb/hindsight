@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from hindsight_api.config import get_config
 from hindsight_api.engine.reflect.agent import run_reflect_agent
 from hindsight_api.engine.reflect.prompts import (
     _MIN_SPLIT_CHUNK_TOKENS,
@@ -28,7 +29,7 @@ from hindsight_api.engine.reflect.prompts import (
     split_context_history,
 )
 from hindsight_api.engine.reflect.tokenization import count_prompt_tokens
-from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult, TokenUsage
+from hindsight_api.engine.response_models import LLMCallResult, LLMToolCall, LLMToolCallResult, TokenUsage
 
 # The splitter floors its per-chunk budget at _MIN_SPLIT_CHUNK_TOKENS, so tests
 # use budgets above the floor to exercise the packing logic itself.
@@ -144,12 +145,17 @@ class TestSplitSynthesisAgentFlow:
             # the final system prompt. Answer accordingly so the test can tell
             # which output made it into the result.
             if "extract evidence" in messages[0]["content"]:
-                return (
-                    f"- claim from prompt of {count_prompt_tokens(messages[1]['content'])} tokens "
-                    "(mentioned_at: 2026-01-01; occurred: unknown; memory_ids: mem-1)",
-                    TokenUsage(input_tokens=10, output_tokens=5, total_tokens=15),
+                return LLMCallResult(
+                    content=(
+                        f"- claim from prompt of {count_prompt_tokens(messages[1]['content'])} tokens "
+                        "(mentioned_at: 2026-01-01; occurred: unknown; memory_ids: mem-1)"
+                    ),
+                    usage=TokenUsage(input_tokens=10, output_tokens=5, total_tokens=15),
                 )
-            return (final_answer, TokenUsage(input_tokens=20, output_tokens=10, total_tokens=30))
+            return LLMCallResult(
+                content=final_answer,
+                usage=TokenUsage(input_tokens=20, output_tokens=10, total_tokens=30),
+            )
 
         llm.call = AsyncMock(side_effect=_call)
         return llm
@@ -158,6 +164,7 @@ class TestSplitSynthesisAgentFlow:
     def _functions(recall_payload: dict):
         return {
             "search_mental_models_fn": AsyncMock(return_value={"mental_models": []}),
+            "read_mental_models_fn": AsyncMock(return_value={"mental_models": []}),
             "search_observations_fn": AsyncMock(return_value={"observations": []}),
             "recall_fn": AsyncMock(return_value=recall_payload),
             "expand_fn": AsyncMock(return_value={"memories": []}),
@@ -227,6 +234,77 @@ class TestSplitSynthesisAgentFlow:
         assert "approximately 64 tokens" in reduce_prompt, "length target must reach the reduce prompt"
 
     @pytest.mark.asyncio
+    async def test_map_calls_run_at_temperature_zero(self):
+        """The map calls copy claims and ids out of a chunk; they don't reason or
+        write, so they must not inherit reflect's 0.9 writing temperature. At 0.9 a
+        map call sometimes answered a plainly relevant chunk with the six-token
+        "(no relevant evidence)" sentinel, silently dropping that chunk's evidence
+        from the reduce (#4054). The reduce itself still writes, so it keeps the
+        reflect temperature."""
+        big = {"memories": [{"id": f"mem-{i}", "text": "fact " + "z" * 600} for i in range(60)]}
+        llm = self._mock_llm()
+        llm.call_with_tools.return_value = LLMToolCallResult(
+            tool_calls=[LLMToolCall(id="1", name="recall", arguments={"query": "q"})],
+            finish_reason="tool_calls",
+        )
+
+        await run_reflect_agent(
+            llm_config=llm,
+            bank_id="b",
+            query="q?",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            max_context_tokens=int(_MIN_SPLIT_CHUNK_TOKENS / 0.8) + 10,
+            **self._functions(big),
+        )
+
+        map_calls = [c for c in llm.call.await_args_list if "extract evidence" in c.kwargs["messages"][0]["content"]]
+        assert len(map_calls) >= 2, "split synthesis did not engage"
+        assert all(c.kwargs["temperature"] == 0.0 for c in map_calls), (
+            f"map calls ran at {[c.kwargs['temperature'] for c in map_calls]}"
+        )
+        reduce_call = llm.call.await_args_list[-1]
+        assert reduce_call.kwargs["temperature"] == get_config().llm_temperature_reflect
+
+    @pytest.mark.asyncio
+    async def test_map_calls_omit_temperature_when_reflect_omits_it(self, monkeypatch):
+        """HINDSIGHT_API_LLM_TEMPERATURE=none drops the parameter from the request —
+        that is how models rejecting any temperature are run. The map pass must keep
+        omitting it rather than pinning its own 0."""
+        import hindsight_api.engine.reflect.agent as agent_module
+
+        # get_config() returns a proxy, not a dataclass, so the omit sentinel is
+        # simulated by shadowing just that attribute.
+        real_config = get_config()
+
+        class _NoTemperature:
+            llm_temperature_reflect = None
+
+            def __getattr__(self, name):
+                return getattr(real_config, name)
+
+        monkeypatch.setattr(agent_module, "get_config", _NoTemperature)
+
+        big = {"memories": [{"id": f"mem-{i}", "text": "fact " + "z" * 600} for i in range(60)]}
+        llm = self._mock_llm()
+        llm.call_with_tools.return_value = LLMToolCallResult(
+            tool_calls=[LLMToolCall(id="1", name="recall", arguments={"query": "q"})],
+            finish_reason="tool_calls",
+        )
+
+        await run_reflect_agent(
+            llm_config=llm,
+            bank_id="b",
+            query="q?",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            max_context_tokens=int(_MIN_SPLIT_CHUNK_TOKENS / 0.8) + 10,
+            **self._functions(big),
+        )
+
+        assert all(c.kwargs["temperature"] is None for c in llm.call.await_args_list), (
+            f"temperature was reintroduced: {[c.kwargs['temperature'] for c in llm.call.await_args_list]}"
+        )
+
+    @pytest.mark.asyncio
     async def test_fitting_history_stays_single_call(self):
         """No overflow → exactly the pre-existing single forced-synthesis call."""
         small = {"memories": [{"id": "mem-1", "text": "one small fact"}]}
@@ -278,8 +356,11 @@ class TestSplitSynthesisAgentFlow:
             for c in llm.call.await_args_list
             if "extract evidence" in c.kwargs["messages"][0]["content"]
         ]
+        # The prompt carries per-reflect aliases (presentation.py) — mem-i is the
+        # (i+1)th fact shown — and a later search lists a memory it already showed
+        # by alias only, so "reaches a map prompt" means written out as an item.
         for i in range(n):
-            holders = [p for p in map_prompts if f'"mem-{i}"' in p]
+            holders = [p for p in map_prompts if f'"id":"f{i + 1}"' in p.replace(" ", "")]
             assert len(holders) == 1, f"mem-{i} appears in {len(holders)} map prompts"
 
 
@@ -319,6 +400,7 @@ class TestSplitSynthesisRealLLM:
 
         functions = {
             "search_mental_models_fn": AsyncMock(return_value={"mental_models": []}),
+            "read_mental_models_fn": AsyncMock(return_value={"mental_models": []}),
             "search_observations_fn": AsyncMock(return_value={"observations": []}),
             "recall_fn": AsyncMock(return_value={"memories": memories}),
             "expand_fn": AsyncMock(return_value={"memories": []}),

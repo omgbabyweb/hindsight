@@ -159,6 +159,19 @@ def test_record_llm_call_success_with_context_and_tokens():
     assert r.llm_info["finish_reason"] == "stop"
 
 
+def test_record_llm_call_keeps_the_prompt_as_sent():
+    """The reflect loop appends its tool call and the tool result to the same list
+    after the call returns, and the row is serialized later. The recorded prompt
+    must be what was sent, not what the list holds by the time it is written."""
+    rec = _CapturingRecorder()
+    messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "q"}]
+    rec.record_llm_call(provider="mock", model="mock", scope="reflect_tool_call", messages=messages)
+    messages.append({"role": "assistant", "tool_calls": [{"id": "1"}]})
+    messages.append({"role": "tool", "content": "{}"})
+
+    assert [m["role"] for m in rec.records[0].input] == ["system", "user"]
+
+
 def test_record_llm_call_error_record():
     rec = _CapturingRecorder()
     rec.record_llm_call(
@@ -198,7 +211,7 @@ def registered_recorder():
 @pytest.mark.asyncio
 async def test_wrapper_success_recorded_by_provider(registered_recorder):
     llm = LLMProvider(provider="mock", api_key="", base_url="", model="mock")
-    result = await llm.call(messages=[{"role": "user", "content": "hello"}], scope="memory")
+    result = (await llm.call(messages=[{"role": "user", "content": "hello"}], scope="memory")).content
 
     assert result == "mock response"
     assert len(registered_recorder.records) == 1
@@ -390,12 +403,14 @@ async def test_retain_extract_success_records_usage_once(registered_recorder):
         return_value=_openai_response_with_usage('{"fact": "the sky is blue"}')
     )
 
-    result = await llm.call(
-        messages=[{"role": "user", "content": "extract facts"}],
-        response_format=_Extracted,
-        scope="retain_extract_facts",
-        max_retries=0,
-    )
+    result = (
+        await llm.call(
+            messages=[{"role": "user", "content": "extract facts"}],
+            response_format=_Extracted,
+            scope="retain_extract_facts",
+            max_retries=0,
+        )
+    ).content
 
     assert isinstance(result, _Extracted)
     assert len(registered_recorder.records) == 1
