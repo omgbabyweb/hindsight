@@ -18,7 +18,7 @@ import { parseArgs } from "node:util";
 import { HindsightClient } from "../client";
 import { SyncEngine, type ReconcileSummary, type SyncConfig } from "../sync";
 import type { Transport } from "../transport";
-import type { ObservationScopes } from "../types";
+import { OBSERVATION_SCOPES, type ObservationScopes } from "../types";
 import { fetchTransport } from "./fetch-transport";
 import { FsVault } from "./fs-vault";
 import {
@@ -74,8 +74,6 @@ export class UsageError extends Error {}
 
 /** Thrown for `--help`; its message is printed to stdout (exit 0). */
 export class HelpRequested extends Error {}
-
-const OBSERVATION_SCOPES = ["combined", "shared", "per_tag", "all_combinations"] as const;
 
 function parseObservationScopes(value: string | undefined): ObservationScopes | undefined {
   if (value === undefined) return undefined;
@@ -137,7 +135,7 @@ export function parseCliArgs(argv: string[]): CliOptions {
     exclude: values.exclude ?? [],
     vaultName,
     prefixDocId: values["prefix-doc-id"] ?? false,
-    ...(observationScopes ? { observationScopes } : {}),
+    observationScopes,
     indexPath: values.index || defaultIndexPath(identity),
     watch: values.watch ?? false,
     identity,
@@ -151,7 +149,7 @@ export function buildConfig(opts: CliOptions): SyncConfig {
     excludeFolders: opts.exclude,
     vaultName: opts.vaultName,
     prefixDocId: opts.prefixDocId,
-    ...(opts.observationScopes ? { observationScopes: opts.observationScopes } : {}),
+    observationScopes: opts.observationScopes,
   };
 }
 

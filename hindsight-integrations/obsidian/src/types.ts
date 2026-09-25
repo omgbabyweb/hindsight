@@ -6,7 +6,8 @@
 
 export type Budget = "low" | "mid" | "high";
 
-export type ObservationScopes = "combined" | "shared" | "per_tag" | "all_combinations";
+export const OBSERVATION_SCOPES = ["combined", "shared", "per_tag", "all_combinations"] as const;
+export type ObservationScopes = (typeof OBSERVATION_SCOPES)[number];
 
 export type TagMatch = "any" | "all" | "any_strict" | "all_strict";
 
